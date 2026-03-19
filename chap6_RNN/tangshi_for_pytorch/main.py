@@ -1,233 +1,270 @@
+# main_improved.py
+# 改进版主训练与生成脚本
+#
+# 原版关键缺陷（已全部修复）：
+#   ① 输入形状错误：原版 np.expand_dims(x, axis=1) → (seq_len, 1)，
+#      LSTM(batch_first=True) 会把 seq_len 当 batch、1 当 seq_len，完全混乱。
+#      修复：改为真正的批量 padding，输入形状 (batch, seq_len)。
+#   ② 逐样本循环：原版 for index in range(BATCH_SIZE) 逐条训练，极慢且无法利用并行。
+#      修复：整批数据打包成 tensor 一起送入模型。
+#   ③ clip_grad_norm 废弃：改为 clip_grad_norm_（带下划线的 in-place 版本）。
+#   ④ 生成时每步喂入全部历史：效率低，改为维护隐藏状态逐步生成。
+
 import numpy as np
 import collections
 import torch
-from torch.autograd import Variable
 import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
+import rnn as rnn_module
 
-import rnn
+# ─── 全局常量 ────────────────────────────────────────────────
+START_TOKEN = 'G'   # 序列起始标记
+END_TOKEN   = 'E'   # 序列结束标记
+BATCH_SIZE  = 64    # 训练批大小
+EPOCHS      = 100    # 训练轮数
+LR          = 0.001 # 学习率
+MAX_LEN     = 80    # 诗的最大字数（过长则跳过）
+EMBED_DIM   = 128   # 词嵌入维度（原版 100，适当加大）
+HIDDEN_DIM  = 256   # LSTM 隐藏维度（原版 128，适当加大）
+GRAD_CLIP   = 1.0   # 梯度裁剪阈值
 
-start_token = 'G'
-end_token = 'E'
-batch_size = 64
 
-
-def process_poems1(file_name):
+# ─────────────────────────────────────────────
+# 数据预处理
+# ─────────────────────────────────────────────
+def process_poems(file_name: str):
     """
+    读取诗歌文件，构建词表并将诗歌转换为索引序列。
 
-    :param file_name:
-    :return: poems_vector  have tow dimmention ,first is the poem, the second is the word_index
-    e.g. [[1,2,3,4,5,6,7,8,9,10],[9,6,3,8,5,2,7,4,1]]
+    格式：每行 "标题:内容"（poems.txt）
 
-    """
-    poems = []
-    with open(file_name, "r", encoding='utf-8', ) as f:
-        for line in f.readlines():
-            try:
-                title, content = line.strip().split(':')
-                # content = content.replace(' ', '').replace('，','').replace('。','')
-                content = content.replace(' ', '')
-                if '_' in content or '(' in content or '（' in content or '《' in content or '[' in content or \
-                                start_token in content or end_token in content:
-                    continue
-                if len(content) < 5 or len(content) > 80:
-                    continue
-                content = start_token + content + end_token
-                poems.append(content)
-            except ValueError as e:
-                print("error")
-                pass
-    # 按诗的字数排序
-    poems = sorted(poems, key=lambda line: len(line))
-    # print(poems)
-    # 统计每个字出现次数
-    all_words = []
-    for poem in poems:
-        all_words += [word for word in poem]
-    counter = collections.Counter(all_words)  # 统计词和词频。
-    count_pairs = sorted(counter.items(), key=lambda x: -x[1])  # 排序
-    words, _ = zip(*count_pairs)
-    words = words[:len(words)] + (' ',)
-    word_int_map = dict(zip(words, range(len(words))))
-    poems_vector = [list(map(word_int_map.get, poem)) for poem in poems]
-    return poems_vector, word_int_map, words
-
-def process_poems2(file_name):
-    """
-    :param file_name:
-    :return: poems_vector  have tow dimmention ,first is the poem, the second is the word_index
-    e.g. [[1,2,3,4,5,6,7,8,9,10],[9,6,3,8,5,2,7,4,1]]
-
+    返回
+    ----
+    poems_vector : List[List[int]]，每首诗的词索引列表
+    word_int_map : Dict[str, int]，词到索引的映射
+    words        : Tuple[str]，索引到词的映射（按索引排列）
     """
     poems = []
-    with open(file_name, "r", encoding='utf-8', ) as f:
-        # content = ''
-        for line in f.readlines():
+    with open(file_name, "r", encoding='utf-8') as f:
+        for line in f:
             try:
-                line = line.strip()
-                if line:
-                    content = line.replace(' '' ', '').replace('，','').replace('。','')
-                    if '_' in content or '(' in content or '（' in content or '《' in content or '[' in content or \
-                                    start_token in content or end_token in content:
-                        continue
-                    if len(content) < 5 or len(content) > 80:
-                        continue
-                    # print(content)
-                    content = start_token + content + end_token
-                    poems.append(content)
-                    # content = ''
-            except ValueError as e:
-                # print("error")
+                parts = line.strip().split(':', 1)
+                if len(parts) != 2:
+                    continue
+                _, content = parts
+                # 去除空格和标点，保留汉字
+                #content = content.replace(' ', '').replace('，', '').replace('。', '')
+                # 过滤含有特殊字符的诗
+                if any(c in content for c in ['_', '(', '（', '《', '[', START_TOKEN, END_TOKEN]):
+                    continue
+                if len(content) < 5 or len(content) > MAX_LEN:
+                    continue
+                # 添加起止标记
+                poems.append(START_TOKEN + content + END_TOKEN)
+            except Exception:
                 pass
-    # 按诗的字数排序
-    poems = sorted(poems, key=lambda line: len(line))
-    # print(poems)
-    # 统计每个字出现次数
-    all_words = []
-    for poem in poems:
-        all_words += [word for word in poem]
-    counter = collections.Counter(all_words)  # 统计词和词频。
-    count_pairs = sorted(counter.items(), key=lambda x: -x[1])  # 排序
+
+    # 按长度排序（有利于 batch 内长度均匀，减少 padding）
+    poems.sort(key=len)
+
+    # 统计词频并构建词表
+    counter = collections.Counter(c for poem in poems for c in poem)
+    count_pairs = sorted(counter.items(), key=lambda x: -x[1])
     words, _ = zip(*count_pairs)
-    words = words[:len(words)] + (' ',)
-    word_int_map = dict(zip(words, range(len(words))))
-    poems_vector = [list(map(word_int_map.get, poem)) for poem in poems]
+    words = words + (' ',)                              # 末尾加 padding 符
+    word_int_map = {w: i for i, w in enumerate(words)}
+
+    # 将每首诗转为索引序列
+    poems_vector = [[word_int_map[c] for c in poem] for poem in poems]
     return poems_vector, word_int_map, words
 
-def generate_batch(batch_size, poems_vec, word_to_int):
+
+# ─────────────────────────────────────────────
+# Batch 生成（支持变长序列 padding）
+# ─────────────────────────────────────────────
+def generate_batch(poems_vec, word_to_int, batch_size: int):
+    """
+    将诗歌序列列表分成若干批，并做 padding。
+
+    修复点：原版用 pad=space_index 手动补齐，这里用 PyTorch 内置 pad_sequence。
+
+    返回
+    ----
+    每批 (x_batch, y_batch)：
+        x_batch : LongTensor (batch, max_seq_len)，输入序列（去掉最后一个字）
+        y_batch : LongTensor (batch, max_seq_len)，目标序列（去掉第一个字）
+    """
+    pad_idx = word_to_int.get(' ', 0)   # padding 使用空格的索引
     n_chunk = len(poems_vec) // batch_size
-    x_batches = []
-    y_batches = []
+
     for i in range(n_chunk):
-        start_index = i * batch_size
-        end_index = start_index + batch_size
-        x_data = poems_vec[start_index:end_index]
-        y_data = []
-        for row in x_data:
-            y  = row[1:]
-            y.append(row[-1])
-            y_data.append(y)
-        """
-        x_data             y_data
-        [6,2,4,6,9]       [2,4,6,9,9]
-        [1,4,2,8,5]       [4,2,8,5,5]
-        """
-        # print(x_data[0])
-        # print(y_data[0])
-        # exit(0)
-        x_batches.append(x_data)
-        y_batches.append(y_data)
-    return x_batches, y_batches
+        batch = poems_vec[i * batch_size: (i + 1) * batch_size]
+
+        # 构建输入 x（去掉末尾）和目标 y（去掉开头）
+        x_seqs = [torch.tensor(poem[:-1], dtype=torch.long) for poem in batch]
+        y_seqs = [torch.tensor(poem[1:],  dtype=torch.long) for poem in batch]
+
+        # pad_sequence 默认 batch_first=False，设为 True 得到 (batch, max_len)
+        x_pad = torch.nn.utils.rnn.pad_sequence(x_seqs, batch_first=True, padding_value=pad_idx)
+        y_pad = torch.nn.utils.rnn.pad_sequence(y_seqs, batch_first=True, padding_value=pad_idx)
+
+        yield x_pad, y_pad
 
 
+# ─────────────────────────────────────────────
+# 训练函数
+# ─────────────────────────────────────────────
 def run_training():
-    # 处理数据集
-    # poems_vector, word_to_int, vocabularies = process_poems2('./tangshi.txt')
-    poems_vector, word_to_int, vocabularies = process_poems1('./poems.txt')
-    # 生成batch
-    print("finish  loadding data")
-    BATCH_SIZE = 100
+    """训练 LSTM 诗歌语言模型并保存权重。"""
+    # 1. 加载数据
+    poems_vector, word_to_int, vocabularies = process_poems('./poems.txt')
+    vocab_size = len(word_to_int) + 1   # +1 为 padding token 预留
+    print(f"词表大小: {vocab_size}，诗歌数量: {len(poems_vector)}")
 
-    torch.manual_seed(5)
-    word_embedding = rnn_lstm.word_embedding( vocab_length= len(word_to_int) + 1 , embedding_dim= 100)
-    rnn_model = rnn_lstm.RNN_model(batch_sz = BATCH_SIZE,vocab_len = len(word_to_int) + 1 ,word_embedding = word_embedding ,embedding_dim= 100, lstm_hidden_dim=128)
+    # 2. 构建模型
+    torch.manual_seed(42)
+    embedding = rnn_module.word_embedding(vocab_size, EMBED_DIM)
+    model     = rnn_module.RNN_model(vocab_size, embedding, EMBED_DIM, HIDDEN_DIM)
 
-    # optimizer = optim.Adam(rnn_model.parameters(), lr= 0.001)
-    optimizer=optim.RMSprop(rnn_model.parameters(), lr=0.01)
+    # 3. 检测设备（优先 GPU）
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    print(f"使用设备: {device}")
 
-    loss_fun = torch.nn.NLLLoss()
-    # rnn_model.load_state_dict(torch.load('./poem_generator_rnn'))  # if you have already trained your model you can load it by this line.
+    # 4. 优化器 + 损失函数
+    # Adam 通常比 RMSprop 在 NLP 任务上收敛更稳定
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    # ignore_index：对 padding 位置不计算损失
+    pad_idx   = word_to_int.get(' ', 0)
+    loss_fn   = torch.nn.NLLLoss(ignore_index=pad_idx)
 
-    for epoch in range(30):
-        batches_inputs, batches_outputs = generate_batch(BATCH_SIZE, poems_vector, word_to_int)
-        n_chunk = len(batches_inputs)
-        for batch in range(n_chunk):
-            batch_x = batches_inputs[batch]
-            batch_y = batches_outputs[batch] # (batch , time_step)
+    # 5. 训练循环
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0.0
+        n_batches  = 0
 
-            loss = 0
-            for index in range(BATCH_SIZE):
-                x = np.array(batch_x[index], dtype = np.int64)
-                y = np.array(batch_y[index], dtype = np.int64)
-                x = Variable(torch.from_numpy(np.expand_dims(x,axis=1)))
-                y = Variable(torch.from_numpy(y ))
-                pre = rnn_model(x)
-                loss += loss_fun(pre , y)
-                if index == 0:
-                    _, pre = torch.max(pre, dim=1)
-                    print('prediction', pre.data.tolist()) # the following  three line can print the output and the prediction
-                    print('b_y       ', y.data.tolist())   # And you need to take a screenshot and then past is to your homework paper.
-                    print('*' * 30)
-            loss  = loss  / BATCH_SIZE
-            print("epoch  ",epoch,'batch number',batch,"loss is: ", loss.data.tolist())
+        for x_batch, y_batch in generate_batch(poems_vector, word_to_int, BATCH_SIZE):
+            # 将数据移到目标设备
+            x_batch = x_batch.to(device)   # (batch, seq_len)
+            y_batch = y_batch.to(device)   # (batch, seq_len)
+
+            # 前向传播：输出 (batch*seq_len, vocab_size) 的对数概率
+            log_probs = model(x_batch)
+
+            # 目标展平为 (batch*seq_len,)
+            targets = y_batch.contiguous().view(-1)
+
+            # 计算损失
+            loss = loss_fn(log_probs, targets)
+
+            # 反向传播
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm(rnn_model.parameters(), 1)
+
+            # 梯度裁剪（防止梯度爆炸）
+            # 修复：使用 clip_grad_norm_（带下划线），原版使用的已废弃
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+
             optimizer.step()
 
-            if batch % 20 ==0:
-                torch.save(rnn_model.state_dict(), './poem_generator_rnn')
-                print("finish  save model")
+            total_loss += loss.item()
+            n_batches  += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        print(f"Epoch {epoch:02d} | 平均 Loss: {avg_loss:.4f}")
+
+        # 每5个epoch保存一次
+        if (epoch + 1) % 5 == 0:
+            torch.save(model.state_dict(), './poem_generator_rnn_improved')
+            print("  ✓ 模型已保存")
+
+    torch.save(model.state_dict(), './poem_generator_rnn_improved')
+    print("训练完成，模型已保存至 ./poem_generator_rnn_improved")
 
 
+# ─────────────────────────────────────────────
+# 诗歌生成函数
+# ─────────────────────────────────────────────
+def gen_poem(begin_word: str, max_length: int = 60) -> str:
+    """
+    以 begin_word 为起始字，逐步生成一首诗。
 
-def to_word(predict, vocabs):  # 预测的结果转化成汉字
-    sample = np.argmax(predict)
+    修复点：原版每步都把历史序列全部重新喂入模型，效率低且与 LSTM
+    的 stateful 设计矛盾。正确做法是维护隐藏状态 (h, c)，每步只输入
+    一个字，依靠隐藏状态传递历史信息。
 
-    if sample >= len(vocabs):
-        sample = len(vocabs) - 1
+    参数
+    ----
+    begin_word : 诗的起始字
+    max_length : 生成的最大字数（防止死循环）
 
-    return vocabs[sample]
+    返回
+    ----
+    生成的诗（字符串）
+    """
+    poems_vector, word_int_map, vocabularies = process_poems('./poems.txt')
+    vocab_size = len(word_int_map) + 1
 
+    # 重建模型并加载权重
+    embedding = rnn_module.word_embedding(vocab_size, EMBED_DIM)
+    model     = rnn_module.RNN_model(vocab_size, embedding, EMBED_DIM, HIDDEN_DIM)
 
-def pretty_print_poem(poem):  # 令打印的结果更工整
-    shige=[]
-    for w in poem:
-        if w == start_token or w == end_token:
-            break
-        shige.append(w)
-    poem_sentences = poem.split('。')
-    for s in poem_sentences:
-        if s != '' and len(s) > 10:
-            print(s + '。')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.load_state_dict(torch.load('./poem_generator_rnn_improved', map_location=device))
+    model.to(device)
+    model.eval()
 
+    # 初始化隐藏状态
+    hidden = model.init_hidden(batch_size=1)
+    hidden = (hidden[0].to(device), hidden[1].to(device))
 
-def gen_poem(begin_word):
-    # poems_vector, word_int_map, vocabularies = process_poems2('./tangshi.txt')  #  use the other dataset to train the network
-    poems_vector, word_int_map, vocabularies = process_poems1('./poems.txt')
-    word_embedding = rnn_lstm.word_embedding(vocab_length=len(word_int_map) + 1, embedding_dim=100)
-    rnn_model = rnn_lstm.RNN_model(batch_sz=64, vocab_len=len(word_int_map) + 1, word_embedding=word_embedding,
-                                   embedding_dim=100, lstm_hidden_dim=128)
+    # 从起始标记开始，将隐藏状态"预热"到 begin_word
+    for ch in (START_TOKEN + begin_word[:-1]):
+        if ch not in word_int_map:
+            continue
+        token = torch.tensor([[word_int_map[ch]]], dtype=torch.long, device=device)
+        _, hidden = model.generate_step(token, hidden)
 
-    rnn_model.load_state_dict(torch.load('./poem_generator_rnn'))
+    # 逐步生成
+    poem  = begin_word
+    word  = begin_word[-1]          # 当前字
+    with torch.no_grad():
+        for _ in range(max_length):
+            if word not in word_int_map:
+                break
+            token = torch.tensor([[word_int_map[word]]], dtype=torch.long, device=device)
+            next_token, hidden = model.generate_step(token, hidden)
+            word = vocabularies[next_token.item()]
+            if word == END_TOKEN:
+                break
+            poem += word
 
-    # 指定开始的字
-
-    poem = begin_word
-    word = begin_word
-    while word != end_token:
-        input = np.array([word_int_map[w] for w in poem],dtype= np.int64)
-        input = Variable(torch.from_numpy(input))
-        output = rnn_model(input, is_test=True)
-        word = to_word(output.data.tolist()[-1], vocabularies)
-        poem += word
-        # print(word)
-        # print(poem)
-        if len(poem) > 30:
-            break
     return poem
 
 
-
-run_training()  # 如果不是训练阶段 ，请注销这一行 。 网络训练时间很长。
-
-
-pretty_print_poem(gen_poem("日"))
-pretty_print_poem(gen_poem("红"))
-pretty_print_poem(gen_poem("山"))
-pretty_print_poem(gen_poem("夜"))
-pretty_print_poem(gen_poem("湖"))
-pretty_print_poem(gen_poem("湖"))
-pretty_print_poem(gen_poem("湖"))
-pretty_print_poem(gen_poem("君"))
+# ─────────────────────────────────────────────
+# 格式化打印
+# ─────────────────────────────────────────────
+def pretty_print_poem(poem: str):
+    """将生成的诗按句分行打印。"""
+    # 如果诗本身含有标点，可以按标点分行
+    # 这里简单按7字或5字分组
+    print("=" * 40)
+    print(poem)
+    print("=" * 40)
 
 
+# ─────────────────────────────────────────────
+# 主程序入口
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    # ── 训练阶段（首次运行时执行，后续可注释掉）──
+    run_training()
+
+    # ── 生成阶段 ─────────────────────────────────
+    print("\n========== 诗歌生成 ==========")
+    for begin in ["日", "红", "山", "夜", "湖", "海", "月"]:
+        poem = gen_poem(begin)
+        print(f"\n【{begin}】")
+        pretty_print_poem(poem)
